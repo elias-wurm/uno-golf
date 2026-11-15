@@ -635,6 +635,7 @@ html.dark .avatar-preview { background: #2a2d3a; }
   <div class="card" style="padding:0;">
     <div class="section-hdr"><div class="card-title">🏅 Rangliste</div></div>
     <div id="lb-list"><div class="empty"><span class="empty-icon">📊</span>Noch keine Spiele.</div></div>
+    <div style="font-size:10px;color:var(--muted);padding:8px 14px 12px;line-height:1.4;">Wertung = Ø Punkte pro Runde, gewichtet nach Anzahl Spiele. Wer wenig gespielt hat, wird Richtung Gesamtschnitt gezogen – Glückstreffer zählen weniger. Niedriger = besser.</div>
   </div>
   <div class="card" style="padding:0;">
     <div class="section-hdr"><div class="card-title">📋 Letzte Spiele</div></div>
@@ -1309,11 +1310,74 @@ async function loadATS() {
       .map(d => ({ id: d.id, ...d.data() }))
       .filter(g => g.finished)
       .sort((a, b) => (b.finishedAt || '').localeCompare(a.finishedAt || ''));
-    const pSnap = await getDocs(collection(window._db, 'playerStats'));
-    const ps = {};
-    pSnap.docs.forEach(d => { ps[d.data().name] = d.data(); });
-    ats = { games, ps };
+    // Spielerstatistik direkt aus den Spielen berechnen → bleibt nach Löschen korrekt
+    ats = { games, ps: computePlayerStats(games) };
   } catch(e) { console.warn('loadATS error:', e); }
+}
+
+function computePlayerStats(games) {
+  const ps = {};
+  games.forEach(g => {
+    (g.ranked || []).forEach((r, i) => {
+      const s = ps[r.name] || (ps[r.name] = { name: r.name, games:0, wins:0, totalScore:0, rounds:0, bestGame:null });
+      s.games++;
+      s.rounds     += g.rounds || 0;
+      s.totalScore += Number(r.total) || 0;
+      if (i === 0) s.wins++;
+      s.bestGame = s.bestGame === null ? r.total : Math.min(s.bestGame, r.total);
+    });
+  });
+  return ps;
+}
+
+// playerStats-Collection in Firestore mit den verbleibenden Spielen synchronisieren
+async function syncPlayerStats(ps) {
+  const { collection, getDocs, deleteDoc, setDoc, doc } = window._fbOps;
+  const snap = await getDocs(collection(window._db, 'playerStats'));
+  await Promise.all(snap.docs.map(d => deleteDoc(doc(window._db, 'playerStats', d.id))));
+  await Promise.all(Object.values(ps).map(s =>
+    setDoc(doc(window._db, 'playerStats', s.name.replace(/[^a-zA-Z0-9]/g, '_')), s)
+  ));
+}
+
+// ── DELETE SINGLE GAME ───────────────────────────────────
+let _delArmed = null;
+async function deleteGame(id, btn) {
+  if (!window._db || !id) return;
+  if (_delArmed !== id) {            // 1. Tipp: scharf schalten
+    _delArmed = id;
+    btn.textContent = '⚠️ Wirklich löschen? Nochmal tippen';
+    setTimeout(() => { if (_delArmed === id) { _delArmed = null; btn.textContent = '🗑 Spiel löschen'; } }, 4000);
+    return;
+  }
+  _delArmed = null;                  // 2. Tipp: löschen
+  btn.textContent = 'Lösche…';
+  btn.style.pointerEvents = 'none';
+  try {
+    const { doc, deleteDoc } = window._fbOps;
+    await deleteDoc(doc(window._db, 'games', id));
+    await loadATS();
+    await syncPlayerStats(ats.ps).catch(e => console.warn('playerStats sync:', e));
+    closeDetail();
+    if (document.getElementById('tab-history').classList.contains('active')) renderHistory();
+    renderStats();
+  } catch(e) {
+    alert('Löschen fehlgeschlagen: ' + e.message);
+    btn.textContent = '🗑 Spiel löschen';
+    btn.style.pointerEvents = '';
+  }
+}
+
+// Gewichteter Schnitt (Bayes): wenige Spiele werden Richtung Gesamtschnitt gezogen.
+// PRIOR_GAMES = wie viele "Durchschnittsspiele" jeder virtuell mitbringt.
+const PRIOR_GAMES = 3;
+function rankScores(entries) {
+  const totR = entries.reduce((s, e) => s + e.rounds, 0);
+  const totG = entries.reduce((s, e) => s + e.games, 0);
+  const mean = totR ? entries.reduce((s, e) => s + e.totalScore, 0) / totR : 0;
+  const priorRounds = PRIOR_GAMES * (totG ? totR / totG : 1);
+  entries.forEach(e => { e.rating = (e.totalScore + priorRounds * mean) / (e.rounds + priorRounds); });
+  return entries.sort((a, b) => a.rating - b.rating || b.games - a.games);
 }
 
 // ── HISTORY TAB ──────────────────────────────────────────
@@ -1421,7 +1485,9 @@ function openDetail(id) {
     <div style="font-size:12px;color:var(--muted);margin-bottom:14px;">${date} · ${(g.players||[]).length} Spieler</div>
     ${podiumHtml}
     ${scoreTableHtml}
+    ${g.id ? `<button class="btn btn-danger btn-full" style="margin-top:8px;" onclick="deleteGame('${g.id}', this)">🗑 Spiel löschen</button>` : ''}
   `;
+  _delArmed = null;
 
   document.getElementById('game-detail-modal').classList.add('open');
 }
@@ -1444,9 +1510,7 @@ function renderStats() {
     document.getElementById('s-best').textContent      = best !== null ? best : '–';
     document.getElementById('s-best-name').textContent = bestName;
 
-    const entries = Object.values(ps).sort((a,b) =>
-      (a.totalScore/(a.rounds||1)) - (b.totalScore/(b.rounds||1))
-    );
+    const entries = rankScores(Object.values(ps));
     document.getElementById('lb-list').innerHTML = entries.length
       ? entries.map((s, i) => {
           const avgGame  = (s.totalScore / (s.games||1)).toFixed(1);
@@ -1468,9 +1532,9 @@ function renderStats() {
               </div>
             </div>
             <div class="lb-right">
-              <div class="lb-avg">${avgRound}</div>
-              <div class="lb-avg-label">Ø / Runde</div>
-              <div style="font-size:10px;color:var(--muted);margin-top:1px;">${avgGame} / Spiel</div>
+              <div class="lb-avg">${s.rating.toFixed(1)}</div>
+              <div class="lb-avg-label">Wertung</div>
+              <div style="font-size:10px;color:var(--muted);margin-top:1px;">Ø ${avgRound} / Rd · ${avgGame} / Spiel</div>
             </div>
           </div>`;
         }).join('')
@@ -1484,7 +1548,9 @@ function renderStats() {
           const winner = g.ranked?.[0]?.name || '–';
           const plist  = (g.players||[]).join(', ');
           const scores = g.ranked ? g.ranked.map(r=>r.total).join(' · ') : '';
-          return `<div class="hist-item">
+          if (!window._histGames) window._histGames = {};
+          window._histGames[g.id] = g;
+          return `<div class="hist-item" style="cursor:pointer;" onclick="openDetail('${g.id}')">
             <div class="hist-top">
               <div class="hist-winner">🏆 ${esc(winner)}</div>
               <div class="hist-date">${date}</div>
